@@ -6,8 +6,8 @@
     "js": "index.js",
     "css": "style.css",
     "author": "Ace",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "license": "MIT",
     "homePage": "https://github.com/Ace2k5/SillyTavern-DraftFlow",
-    "description": "Automatically runs one extra self-review pass on each character reply and replaces the draft with the revised text."
+    "description": "Gives each character reply one extra audit-and-rewrite pass against the active preset, then replaces the draft in place."
 }

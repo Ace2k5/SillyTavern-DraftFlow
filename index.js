@@ -1,9 +1,10 @@
 /**
- * DraftFlow 0.2 — automatic self-review of the latest reply.
+ * DraftFlow 0.3 — automatic self-review of the latest reply.
  *
  * After SillyTavern renders a character message, DraftFlow runs one extra quiet
- * generation in which the model critiques that exact message and rewrites it.
- * The message is then replaced in place, so the chat keeps a single reply.
+ * generation. The model first audits that message against the active preset's
+ * requirements, then rewrites it so those requirements are satisfied. The
+ * message is replaced in place, so the chat keeps a single reply.
  *
  * No imports from SillyTavern's module tree: everything comes from
  * SillyTavern.getContext(), so the folder works from data/<user>/extensions or
@@ -14,6 +15,22 @@ const MODULE_KEY = 'DraftFlow';
 const EXTENSION_ID = 'third-party/SillyTavern-DraftFlow';
 
 const REVIEW_PROMPT_DEFAULT = [
+    'The last message in the chat is the finished reply {{char}} just wrote. Do not continue the scene and do not write a new turn.',
+    '',
+    'Your job is to make that reply comply with the active preset as closely as possible. The preset, character card, and chat history above define the rules: output format, required sections, tags, language rules, analysis or translation blocks, POV, tense, length, and anything else the preset insists on. Follow them even if the draft did not.',
+    '',
+    '<message>',
+    '%DRAFT%',
+    '</message>',
+    '',
+    'Step 1 — audit. In <audit>, briefly list every mandatory requirement you can find in the active preset and character card. For each one, say whether the draft satisfies it and what you will fix. Keep it to one line per requirement.',
+    '',
+    'Step 2 — rewrite. In <revised>, output the complete final reply with every requirement satisfied. If the draft missed a required section or rule, add or repair it. Do not drop required content to make the reply shorter or cleaner, and do not restate the audit.',
+    '',
+    'Output exactly these two blocks and nothing else. The revised text must be the entire message, not a summary or a continuation.',
+].join('\n');
+
+const REVIEW_PROMPT_V02 = [
     'The last message in the chat is the finished reply {{char}} just wrote. Do not continue the scene and do not write a new message.',
     '',
     '<message>',
@@ -31,11 +48,14 @@ const REVIEW_PROMPT_DEFAULT = [
     'Do not include the critique, a preamble, labels, or commentary. If it is already good, change as little as possible.',
 ].join('\n');
 
+const PROMPT_VERSION = 3;
+
 const DEFAULT_SETTINGS = {
     enabled: true,
     refineSwipes: true,
     maxTokens: 0,
     reviewPrompt: REVIEW_PROMPT_DEFAULT,
+    promptVersion: PROMPT_VERSION,
 };
 
 let isRefining = false;
@@ -65,11 +85,22 @@ function getSettings() {
     const context = ctx();
     context.extensionSettings[MODULE_KEY] ??= {};
     const settings = context.extensionSettings[MODULE_KEY];
+    const storedPromptVersion = settings.promptVersion;
 
     for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
         if (settings[key] === undefined) {
             settings[key] = value;
         }
+    }
+
+    if (storedPromptVersion !== PROMPT_VERSION) {
+        if (!settings.reviewPrompt || settings.reviewPrompt === REVIEW_PROMPT_V02) {
+            settings.reviewPrompt = REVIEW_PROMPT_DEFAULT;
+        } else if (!String(settings.reviewPrompt).includes('<audit>')) {
+            console.warn('[DraftFlow] Custom review prompt kept. Add an <audit> step to it to use the compliance pass.');
+        }
+        settings.promptVersion = PROMPT_VERSION;
+        saveSettings();
     }
 
     return settings;
@@ -121,6 +152,22 @@ function installSendGuard() {
 }
 
 /**
+ * Sends the model's audit to the console for debugging. The audit is never
+ * shown in the chat; it only exists to make the model enumerate the preset's
+ * requirements before rewriting.
+ * @param {string} raw Model output
+ */
+function logAudit(raw) {
+    const text = String(raw ?? '');
+    const audit = text.match(/<audit>([\s\S]*?)<\/audit>/i);
+    if (audit && audit[1].trim()) {
+        console.debug('[DraftFlow] Review audit:\n' + audit[1].trim());
+    } else {
+        console.debug('[DraftFlow] The review did not return an <audit> block.');
+    }
+}
+
+/**
  * Pulls the rewritten message out of the model output.
  * @param {string} raw Model output
  * @returns {string} Clean revised text
@@ -130,6 +177,9 @@ function extractRevision(raw) {
     const tagged = text.match(/<revised>([\s\S]*?)<\/revised>/i);
     if (tagged) {
         text = tagged[1];
+    } else {
+        // If the wrapper is missing, drop a preceding audit and use the rest.
+        text = text.replace(/<audit>[\s\S]*?<\/audit>/i, '').trim();
     }
 
     text = text
@@ -153,7 +203,8 @@ async function estimateResponseLength(original) {
         const tokens = await context.getTokenCountAsync(original, 0);
         const contextSize = Number(context.maxContext) || 8192;
         if (Number.isFinite(tokens) && tokens > 0) {
-            return Math.min(Math.max(256, Math.ceil(tokens * 1.3) + 48), Math.floor(contextSize * 0.5));
+            // Room for the rewritten message plus the private audit that precedes it.
+            return Math.min(Math.max(384, Math.ceil(tokens * 1.3) + 400), Math.floor(contextSize * 0.5));
         }
     } catch {
         // Fall through to the backend's default reply length.
@@ -267,6 +318,7 @@ async function refineReply(messageId, { manual = false } = {}) {
             return false;
         }
 
+        logAudit(raw);
         const revised = extractRevision(raw);
         if (!revised) {
             throw new Error('The review pass returned nothing usable.');

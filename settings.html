@@ -6,7 +6,7 @@
         </div>
         <div class="inline-drawer-content">
             <div class="draftflow-row">
-                <label class="checkbox_label" title="After each character reply, run one extra hidden generation that critiques and rewrites it.">
+                <label class="checkbox_label" title="After each character reply, run one extra hidden generation that audits the active preset's rules and rewrites the reply against them.">
                     <input id="draftflow_enabled" type="checkbox" />
                     Refine every new reply automatically
                 </label>
@@ -28,7 +28,7 @@
                     min="0"
                     max="8000"
                     step="50"
-                    title="0 = auto: size the revision from the original reply (about 1.3x)."
+                    title="0 = auto: the reply's size plus about 400 tokens for the audit. A fixed value must cover both the audit and the rewrite."
                 />
             </div>
 
@@ -43,9 +43,11 @@
 
             <small class="draftflow-hint">
                 The reply is generated normally first, so you will see the draft and then the revised text replaces it
-                in place. The chat keeps one message. Each refinement costs one extra generation call; use the toggle
-                above to turn it off. Revert only restores the most recent refinement while that message still holds
-                the revised text.
+                in place. The chat keeps one message. The review first audits the active preset's requirements in an
+                <code>&lt;audit&gt;</code> block (written to the browser console), then rewrites the reply inside
+                <code>&lt;revised&gt;</code>. Each refinement costs one extra generation call; use the toggle above to
+                turn it off. Revert only restores the most recent refinement while that message still holds the revised
+                text.
             </small>
 
             <details class="draftflow-prompts">
@@ -67,8 +69,9 @@
                 <small class="draftflow-hint">
                     <code>%DRAFT%</code> is replaced with the reply being reviewed. SillyTavern macros such as
                     <code>&#123;&#123;char&#125;&#125;</code> and <code>&#123;&#123;user&#125;&#125;</code> are resolved
-                    by the normal generation pipeline. Keep the <code>&lt;revised&gt;</code> instruction intact so the
-                    extension can tell the rewrite apart from any stray commentary.
+                    by the normal generation pipeline. Keep the <code>&lt;audit&gt;</code> then
+                    <code>&lt;revised&gt;</code> structure: the audit makes the model enumerate the preset's rules first,
+                    and the revised block is what replaces the reply.
                 </small>
             </details>
         </div>
