@@ -1,0 +1,91 @@
+<div class="draftflow-settings">
+    <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <b>DraftFlow</b>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+        <div class="inline-drawer-content">
+            <div class="draftflow-row">
+                <label for="draftflow_turns">Messages per batch</label>
+                <input
+                    id="draftflow_turns"
+                    class="text_pole"
+                    type="number"
+                    min="1"
+                    max="10"
+                    step="1"
+                    title="How many consecutive character messages one run should produce."
+                />
+            </div>
+
+            <div class="draftflow-row">
+                <label class="checkbox_label" title="Generate a rough draft, then let the model critique and rewrite it. Uses two API calls instead of one.">
+                    <input id="draftflow_refine" type="checkbox" />
+                    Self-review pass (2 API calls)
+                </label>
+            </div>
+
+            <div class="draftflow-row">
+                <label for="draftflow_tokens">Max tokens per message</label>
+                <input
+                    id="draftflow_tokens"
+                    class="text_pole"
+                    type="number"
+                    min="0"
+                    max="8000"
+                    step="50"
+                    title="0 uses a 400-token fallback per message. Raise this for long-form replies."
+                />
+            </div>
+
+            <div class="draftflow-row draftflow-buttons">
+                <button id="draftflow_generate" class="menu_button" type="button">
+                    <i class="fa-solid fa-feather-pointed"></i> Generate now
+                </button>
+                <button id="draftflow_undo" class="menu_button" type="button">
+                    <i class="fa-solid fa-rotate-left"></i> Undo last batch
+                </button>
+            </div>
+
+            <small class="draftflow-hint">
+                DraftFlow continues from the current chat. Send your own reply first, then run it from the wand menu,
+                the button above, or <code>/draftflow turns=3</code>. Each run costs two generation calls (draft +
+                review). Messages are inserted immediately; Undo only works while the batch is still at the end of the
+                chat.
+            </small>
+
+            <details class="draftflow-prompts">
+                <summary>Prompt templates</summary>
+
+                <label for="draftflow_draft_prompt">Draft pass</label>
+                <textarea
+                    id="draftflow_draft_prompt"
+                    class="text_pole textarea_compact"
+                    rows="9"
+                    spellcheck="false"
+                ></textarea>
+
+                <label for="draftflow_review_prompt">Review pass</label>
+                <textarea
+                    id="draftflow_review_prompt"
+                    class="text_pole textarea_compact"
+                    rows="11"
+                    spellcheck="false"
+                ></textarea>
+
+                <div class="draftflow-row draftflow-buttons">
+                    <button id="draftflow_reset_prompts" class="menu_button" type="button">
+                        <i class="fa-solid fa-undo"></i> Reset prompts
+                    </button>
+                </div>
+
+                <small class="draftflow-hint">
+                    <code>%TURNS%</code> is replaced with the batch size and <code>%DRAFT%</code> with the draft text.
+                    SillyTavern macros such as <code>&#123;&#123;char&#125;&#125;</code> and
+                    <code>&#123;&#123;user&#125;&#125;</code> are resolved by the normal generation pipeline. Keep the
+                    <code>@@TURN@@</code> separator instruction intact or the batch will arrive as a single message.
+                </small>
+            </details>
+        </div>
+    </div>
+</div>

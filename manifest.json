@@ -1,0 +1,13 @@
+{
+    "display_name": "DraftFlow",
+    "loading_order": 120,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "Ace",
+    "version": "0.1.0",
+    "license": "MIT",
+    "homePage": "",
+    "description": "Drafts the next few character messages, reviews its own draft, then inserts the polished turns in one pass."
+}

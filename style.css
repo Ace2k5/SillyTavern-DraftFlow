@@ -1,0 +1,60 @@
+.draftflow-settings .draftflow-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 6px 0;
+    flex-wrap: wrap;
+}
+
+.draftflow-settings .draftflow-row > label:first-child {
+    min-width: 150px;
+}
+
+.draftflow-settings .draftflow-row input[type='number'] {
+    width: 96px;
+}
+
+.draftflow-settings .draftflow-buttons {
+    gap: 8px;
+}
+
+.draftflow-settings .draftflow-hint {
+    display: block;
+    margin-top: 8px;
+    opacity: 0.75;
+    line-height: 1.35;
+}
+
+.draftflow-settings details.draftflow-prompts {
+    margin-top: 10px;
+}
+
+.draftflow-settings details.draftflow-prompts summary {
+    cursor: pointer;
+    user-select: none;
+    margin-bottom: 6px;
+}
+
+.draftflow-settings .draftflow-prompts label {
+    display: block;
+    font-weight: bold;
+    margin-top: 8px;
+}
+
+.draftflow-settings .draftflow-prompts textarea {
+    width: 100%;
+    margin: 4px 0;
+}
+
+.draftflow-settings .draftflow-prompts textarea.textarea_compact {
+    min-height: 120px;
+}
+
+#draftflow_wand_button.disabled {
+    opacity: 0.6;
+    pointer-events: none;
+}
+
+#draftflow_wand_button .draftflow_wand_label {
+    white-space: nowrap;
+}
