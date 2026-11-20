@@ -20,6 +20,13 @@
             </div>
 
             <div class="draftflow-row">
+                <label class="checkbox_label" title="Open the refinement details popup automatically after each pass. Off by default; the wand menu and the button below open it on demand.">
+                    <input id="draftflow_show_details" type="checkbox" />
+                    Show details automatically after each refinement
+                </label>
+            </div>
+
+            <div class="draftflow-row">
                 <label for="draftflow_tokens">Max revision tokens</label>
                 <input
                     id="draftflow_tokens"
@@ -39,15 +46,21 @@
                 <button id="draftflow_revert" class="menu_button" type="button" style="display: none;">
                     <i class="fa-solid fa-rotate-left"></i> Revert last refinement
                 </button>
+                <button id="draftflow_details" class="menu_button" type="button" style="display: none;">
+                    <i class="fa-solid fa-magnifying-glass-chart"></i> Show last refinement details
+                </button>
             </div>
 
             <small class="draftflow-hint">
                 The reply is generated normally first, so you will see the draft and then the revised text replaces it
                 in place. The chat keeps one message. The review first audits the active preset's requirements in an
-                <code>&lt;audit&gt;</code> block (written to the browser console), then rewrites the reply inside
-                <code>&lt;revised&gt;</code>. Each refinement costs one extra generation call; use the toggle above to
-                turn it off. Revert only restores the most recent refinement while that message still holds the revised
-                text.
+                <code>&lt;audit&gt;</code> block, then rewrites the reply inside <code>&lt;revised&gt;</code>. Each
+                refinement costs one extra generation call; use the toggle above to turn it off. Revert only restores
+                the most recent refinement while that message still holds the revised text.
+                <br /><br />
+                <strong>Details</strong> show the audit, the raw output, the prompt and the final reply, plus the
+                model's reasoning when the backend returns it inline. Reasoning that arrives in a separate API field
+                is discarded by quiet generation, so it cannot be shown here.
             </small>
 
             <details class="draftflow-prompts">

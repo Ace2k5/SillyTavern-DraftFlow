@@ -53,6 +53,31 @@
     white-space: nowrap;
 }
 
+.draftflow-details .draftflow-details-meta {
+    opacity: 0.75;
+    margin-bottom: 8px;
+}
+
+.draftflow-details .draftflow-details-section {
+    margin: 6px 0;
+}
+
+.draftflow-details summary {
+    cursor: pointer;
+    font-weight: bold;
+}
+
+.draftflow-details pre {
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin: 6px 0;
+    padding: 8px;
+    background: rgba(0, 0, 0, 0.15);
+    border-radius: 4px;
+    max-height: 45vh;
+    overflow: auto;
+}
+
 .mes.draftflow-refining .mes_text {
     opacity: 0.5;
     transition: opacity 0.2s ease-in-out;

@@ -56,10 +56,12 @@ const DEFAULT_SETTINGS = {
     maxTokens: 0,
     reviewPrompt: REVIEW_PROMPT_DEFAULT,
     promptVersion: PROMPT_VERSION,
+    showDetails: false,
 };
 
 let isRefining = false;
 let stopRequested = false;
+let lastDetails = null;
 
 /** @returns {any} Live SillyTavern context. */
 function ctx() {
@@ -156,15 +158,51 @@ function installSendGuard() {
  * shown in the chat; it only exists to make the model enumerate the preset's
  * requirements before rewriting.
  * @param {string} raw Model output
+ * @returns {string} Audit text, or an empty string
  */
-function logAudit(raw) {
-    const text = String(raw ?? '');
-    const audit = text.match(/<audit>([\s\S]*?)<\/audit>/i);
-    if (audit && audit[1].trim()) {
-        console.debug('[DraftFlow] Review audit:\n' + audit[1].trim());
+function extractAudit(raw) {
+    const audit = String(raw ?? '').match(/<audit>([\s\S]*?)<\/audit>/i);
+    return audit ? audit[1].trim() : '';
+}
+
+function logAudit(audit) {
+    if (audit) {
+        console.debug('[DraftFlow] Review audit:\n' + audit);
     } else {
         console.debug('[DraftFlow] The review did not return an <audit> block.');
     }
+}
+
+/**
+ * Splits inline reasoning from the model output when the backend includes it in
+ * the response text. Reasoning returned in a separate API field is not part of
+ * the quiet generation result, so there is nothing to show for those backends.
+ * @param {string} raw Model output
+ * @returns {{reasoning: string, content: string}}
+ */
+function splitReasoning(raw) {
+    const text = String(raw ?? '');
+    const context = ctx();
+    if (typeof context.parseReasoningFromString === 'function') {
+        try {
+            const parsed = context.parseReasoningFromString(text, { strict: false });
+            if (parsed?.reasoning) {
+                return { reasoning: parsed.reasoning, content: parsed.content ?? '' };
+            }
+        } catch (error) {
+            console.debug('[DraftFlow] Could not parse reasoning', error);
+        }
+    }
+    return { reasoning: '', content: text };
+}
+
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
 }
 
 /**
@@ -230,8 +268,11 @@ function getRefinementRecord() {
 
 function updateActionButtons() {
     const hasRevert = !!getRefinementRecord();
+    const hasDetails = !!lastDetails;
     $('#draftflow_revert').toggle(hasRevert);
     $('#draftflow_revert_wand').toggle(hasRevert);
+    $('#draftflow_details').toggle(hasDetails);
+    $('#draftflow_details_wand').toggle(hasDetails);
     $('#draftflow_refine').prop('disabled', isRefining);
     $('#draftflow_wand_button').toggleClass('disabled', isRefining);
 }
@@ -309,7 +350,7 @@ async function refineReply(messageId, { manual = false } = {}) {
         const raw = await context.generateQuietPrompt({
             quietPrompt: prompt,
             responseLength,
-            removeReasoning: true,
+            removeReasoning: false,
             trimToSentence: true,
         });
 
@@ -318,8 +359,28 @@ async function refineReply(messageId, { manual = false } = {}) {
             return false;
         }
 
-        logAudit(raw);
-        const revised = extractRevision(raw);
+        const { reasoning, content } = splitReasoning(raw);
+        if (reasoning) {
+            console.debug('[DraftFlow] Review reasoning:\n' + reasoning);
+        }
+
+        const audit = extractAudit(content);
+        logAudit(audit);
+        const revised = extractRevision(content);
+
+        lastDetails = {
+            chatId,
+            messageId,
+            at: Date.now(),
+            prompt,
+            audit,
+            reasoning,
+            raw: content,
+            original,
+            revised,
+            applied: false,
+        };
+
         if (!revised) {
             throw new Error('The review pass returned nothing usable.');
         }
@@ -378,8 +439,12 @@ async function refineReply(messageId, { manual = false } = {}) {
 
         context.updateMessageBlock?.(messageId, live);
         await context.saveChat();
+        lastDetails.applied = true;
         updateActionButtons();
         toastr.success('Reply refined.', 'DraftFlow', { timeOut: 2000, preventDuplicates: true });
+        if (settings.showDetails) {
+            showRefinementDetails();
+        }
         return true;
     } catch (error) {
         if (stopRequested || error?.name === 'AbortError' || /abort/i.test(String(error?.message))) {
@@ -464,6 +529,44 @@ async function revertLastRefinement() {
     toastr.success('Reverted to the original reply.', 'DraftFlow');
 }
 
+function showRefinementDetails() {
+    if (!lastDetails) {
+        toastr.info('No refinement details are available in this session.', 'DraftFlow');
+        return;
+    }
+
+    const context = ctx();
+    const details = lastDetails;
+    const section = (title, body, open = false) => {
+        if (!body) {
+            return '';
+        }
+        return `<details class="draftflow-details-section"${open ? ' open' : ''}><summary>${escapeHtml(title)}</summary><pre>${escapeHtml(body)}</pre></details>`;
+    };
+
+    const meta = `Message ${details.messageId} · ${new Date(details.at).toLocaleString()} · ${details.applied ? 'applied' : 'not applied'}`;
+    const html = `<div class="draftflow-details">
+        <div class="draftflow-details-meta">${escapeHtml(meta)}</div>
+        ${section('Audit', details.audit, true)}
+        ${section('Reasoning', details.reasoning)}
+        ${section('Original reply', details.original)}
+        ${section('Final reply', details.revised, true)}
+        ${section('Raw model output', details.raw)}
+        ${section('Review prompt', details.prompt)}
+    </div>`;
+
+    if (typeof context.callGenericPopup === 'function') {
+        context.callGenericPopup(html, context.POPUP_TYPE.TEXT, '', {
+            wide: true,
+            large: true,
+            allowVerticalScrolling: true,
+        });
+    } else {
+        console.debug('[DraftFlow] Refinement details', details);
+        toastr.info('Details were written to the browser console.', 'DraftFlow');
+    }
+}
+
 function onGenerationStarted(type) {
     if (type !== 'quiet') {
         stopRequested = false;
@@ -532,6 +635,13 @@ function bindSettingsPanel() {
             saveSettings();
         });
 
+    $('#draftflow_show_details')
+        .prop('checked', !!settings.showDetails)
+        .on('change', function () {
+            settings.showDetails = !!$(this).prop('checked');
+            saveSettings();
+        });
+
     $('#draftflow_tokens')
         .val(settings.maxTokens)
         .on('input change', function () {
@@ -557,6 +667,7 @@ function bindSettingsPanel() {
 
     $('#draftflow_refine').on('click', () => refineLastReply());
     $('#draftflow_revert').on('click', () => revertLastRefinement());
+    $('#draftflow_details').on('click', () => showRefinementDetails());
 }
 
 async function addSettingsPanel() {
@@ -599,10 +710,18 @@ function addWandButtons(attempt = 0) {
         </div>
     `);
 
-    $menu.append($revert).append($refine);
+    const $details = $(`
+        <div id="draftflow_details_wand" class="list-group-item flex-container flexGap5" title="Show the audit, reasoning, and raw output from the last refinement" style="display: none;">
+            <div class="fa-solid fa-magnifying-glass-chart extensionsMenuExtensionButton"></div>
+            <span>DraftFlow: show last refinement details</span>
+        </div>
+    `);
+
+    $menu.append($details).append($revert).append($refine);
 
     $refine.on('click', () => refineLastReply());
     $revert.on('click', () => revertLastRefinement());
+    $details.on('click', () => showRefinementDetails());
 
     updateActionButtons();
 }

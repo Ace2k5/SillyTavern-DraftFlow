@@ -10,6 +10,10 @@ rewrite replaces the draft **in place**, so the chat history keeps a single mess
 
 This is not a multi-turn batch generator. One reply in, one more compliant reply out.
 
+A **Show last refinement details** action (wand menu or settings) opens the audit, the raw model output, the
+review prompt, the original reply and the final reply. It also shows the model's reasoning when the backend
+returns thinking inline in the response.
+
 ## What it looks like
 
 1. You send your message. SillyTavern generates the character's reply normally, and it appears.
@@ -18,6 +22,7 @@ This is not a multi-turn batch generator. One reply in, one more compliant reply
    `<revised>` message with those requirements satisfied.
 4. The reply is replaced in place (swipes, token count and rendering are updated too). A toast confirms it, and
    **Revert last refinement** restores the previous text if you prefer it.
+5. **Show last refinement details** opens what happened inside the pass, without changing the chat.
 
 The audit never appears in the chat; it is written to the browser console (`[DraftFlow] Review audit:`) so you can
 see what the model thought the preset required. Because the draft is generated first, you briefly see the original
@@ -31,6 +36,9 @@ reply and then the revised version — the model is reviewing the message it act
 - The quiet review instruction asks for `<audit>` first — enumerating mandatory requirements from the preset —
   and then `<revised>` with the complete corrected message. This forces the model to check compliance explicitly
   instead of only polishing prose.
+- Captures the audit and the raw output for the details popup, and parses inline reasoning when the selected
+  reasoning template matches it. Quiet generation returns only the content field, so reasoning that the backend
+  sends separately is not available.
 - Parses `<revised>`, replaces `message.mes`, the active swipe, its swipe metadata, and the token count, then
   re-renders and saves the chat.
 - Stores the previous text in `chat_metadata.DraftFlow.lastRefinement` so the most recent swap can be reverted.
@@ -54,6 +62,8 @@ Only a page reload is needed, not a server restart.
 - **Manual:** wand menu → **DraftFlow: refine last reply**, the button in the settings drawer, or `/draftflow`.
   Manual runs work even when automatic refinement is off.
 - **Undo a swap:** wand menu → **DraftFlow: revert last refinement**, or the button in the settings drawer.
+- **Inspect a pass:** wand menu → **DraftFlow: show last refinement details**, or the settings button. It shows
+  the audit, reasoning (when available), raw output, prompt, original and final text.
 
 Refinement is skipped when it would be unsafe or pointless: group chats, first messages, continuations, system
 messages, stopped generations, an already-refined message, or a chat/message that changed mid-pass.
@@ -64,6 +74,7 @@ messages, stopped generations, an already-refined message, or a chat/message tha
 | --- | --- | --- |
 | Refine every new reply automatically | on | Off means only manual runs. |
 | Also refine swipes and regenerations | on | Off limits automatic refinement to fresh replies; `/draftflow` still works on a swipe. |
+| Show details automatically | off | Opens the details popup after each refinement. On demand via the wand menu/settings when off. |
 | Max revision tokens | 0 (auto) | Auto sizes the budget from the reply plus roughly 400 tokens of audit headroom. Raise for long replies with many required sections. |
 | Review prompt | built in | Editable. `%DRAFT%` is replaced with the reply; `{{char}}` / `{{user}}` are resolved by SillyTavern. Keep the `<audit>` / `<revised>` structure intact. |
 
@@ -88,6 +99,11 @@ want the pass occasionally.
   that happens.
 - **Edited/deleted messages during a pass** cause that revision to be discarded rather than overwriting your edit.
 - **Streaming does not hide the draft.** Streaming finishes, the message is rendered, then the revision replaces it.
+- **Hidden reasoning is best-effort.** DraftFlow captures thinking only when the backend includes it inline in the
+  response text and the selected reasoning template can parse it. APIs that return reasoning in a separate field
+  show only the `<audit>`, which is itself a visible compliance check.
+- **Details are session-only.** The details popup reads the most recent pass held in memory; reloading the page
+  clears it. The audit is also logged to the browser console.
 
 ## Troubleshooting
 
@@ -102,6 +118,8 @@ want the pass occasionally.
 
 ## Version history
 
+- **0.4.0** — added the refinement details popup (audit, inline reasoning when available, raw output, prompt,
+  original and final text), an optional auto-open setting, and console logging for reasoning.
 - **0.3.0** — the review now audits the active preset's requirements in an `<audit>` block before rewriting,
   instead of only polishing the reply. Upgrading from 0.2 replaces the built-in review prompt; a customized prompt
   is kept, with a console warning explaining that it needs an `<audit>` step.
