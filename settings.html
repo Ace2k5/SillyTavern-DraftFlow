@@ -6,27 +6,21 @@
         </div>
         <div class="inline-drawer-content">
             <div class="draftflow-row">
-                <label for="draftflow_turns">Messages per batch</label>
-                <input
-                    id="draftflow_turns"
-                    class="text_pole"
-                    type="number"
-                    min="1"
-                    max="10"
-                    step="1"
-                    title="How many consecutive character messages one run should produce."
-                />
-            </div>
-
-            <div class="draftflow-row">
-                <label class="checkbox_label" title="Generate a rough draft, then let the model critique and rewrite it. Uses two API calls instead of one.">
-                    <input id="draftflow_refine" type="checkbox" />
-                    Self-review pass (2 API calls)
+                <label class="checkbox_label" title="After each character reply, run one extra hidden generation that critiques and rewrites it.">
+                    <input id="draftflow_enabled" type="checkbox" />
+                    Refine every new reply automatically
                 </label>
             </div>
 
             <div class="draftflow-row">
-                <label for="draftflow_tokens">Max tokens per message</label>
+                <label class="checkbox_label" title="Also refine messages produced by swiping or regenerating.">
+                    <input id="draftflow_swipes" type="checkbox" />
+                    Also refine swipes and regenerations
+                </label>
+            </div>
+
+            <div class="draftflow-row">
+                <label for="draftflow_tokens">Max revision tokens</label>
                 <input
                     id="draftflow_tokens"
                     class="text_pole"
@@ -34,56 +28,47 @@
                     min="0"
                     max="8000"
                     step="50"
-                    title="0 uses a 400-token fallback per message. Raise this for long-form replies."
+                    title="0 = auto: size the revision from the original reply (about 1.3x)."
                 />
             </div>
 
             <div class="draftflow-row draftflow-buttons">
-                <button id="draftflow_generate" class="menu_button" type="button">
-                    <i class="fa-solid fa-feather-pointed"></i> Generate now
+                <button id="draftflow_refine" class="menu_button" type="button">
+                    <i class="fa-solid fa-feather-pointed"></i> Refine last reply now
                 </button>
-                <button id="draftflow_undo" class="menu_button" type="button">
-                    <i class="fa-solid fa-rotate-left"></i> Undo last batch
+                <button id="draftflow_revert" class="menu_button" type="button" style="display: none;">
+                    <i class="fa-solid fa-rotate-left"></i> Revert last refinement
                 </button>
             </div>
 
             <small class="draftflow-hint">
-                DraftFlow continues from the current chat. Send your own reply first, then run it from the wand menu,
-                the button above, or <code>/draftflow turns=3</code>. Each run costs two generation calls (draft +
-                review). Messages are inserted immediately; Undo only works while the batch is still at the end of the
-                chat.
+                The reply is generated normally first, so you will see the draft and then the revised text replaces it
+                in place. The chat keeps one message. Each refinement costs one extra generation call; use the toggle
+                above to turn it off. Revert only restores the most recent refinement while that message still holds
+                the revised text.
             </small>
 
             <details class="draftflow-prompts">
-                <summary>Prompt templates</summary>
+                <summary>Review prompt</summary>
 
-                <label for="draftflow_draft_prompt">Draft pass</label>
                 <textarea
-                    id="draftflow_draft_prompt"
+                    id="draftflow_prompt"
                     class="text_pole textarea_compact"
-                    rows="9"
-                    spellcheck="false"
-                ></textarea>
-
-                <label for="draftflow_review_prompt">Review pass</label>
-                <textarea
-                    id="draftflow_review_prompt"
-                    class="text_pole textarea_compact"
-                    rows="11"
+                    rows="12"
                     spellcheck="false"
                 ></textarea>
 
                 <div class="draftflow-row draftflow-buttons">
-                    <button id="draftflow_reset_prompts" class="menu_button" type="button">
-                        <i class="fa-solid fa-undo"></i> Reset prompts
+                    <button id="draftflow_reset_prompt" class="menu_button" type="button">
+                        <i class="fa-solid fa-undo"></i> Reset prompt
                     </button>
                 </div>
 
                 <small class="draftflow-hint">
-                    <code>%TURNS%</code> is replaced with the batch size and <code>%DRAFT%</code> with the draft text.
-                    SillyTavern macros such as <code>&#123;&#123;char&#125;&#125;</code> and
-                    <code>&#123;&#123;user&#125;&#125;</code> are resolved by the normal generation pipeline. Keep the
-                    <code>@@TURN@@</code> separator instruction intact or the batch will arrive as a single message.
+                    <code>%DRAFT%</code> is replaced with the reply being reviewed. SillyTavern macros such as
+                    <code>&#123;&#123;char&#125;&#125;</code> and <code>&#123;&#123;user&#125;&#125;</code> are resolved
+                    by the normal generation pipeline. Keep the <code>&lt;revised&gt;</code> instruction intact so the
+                    extension can tell the rewrite apart from any stray commentary.
                 </small>
             </details>
         </div>

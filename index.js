@@ -1,58 +1,45 @@
 /**
- * DraftFlow — draft → self-review → multi-turn insert for SillyTavern.
+ * DraftFlow 0.2 — automatic self-review of the latest reply.
  *
- * The extension deliberately imports nothing from SillyTavern's module tree:
- * everything it needs comes from SillyTavern.getContext(), so the folder can live
- * in data/<user>/extensions or in the global third-party folder without path edits.
+ * After SillyTavern renders a character message, DraftFlow runs one extra quiet
+ * generation in which the model critiques that exact message and rewrites it.
+ * The message is then replaced in place, so the chat keeps a single reply.
+ *
+ * No imports from SillyTavern's module tree: everything comes from
+ * SillyTavern.getContext(), so the folder works from data/<user>/extensions or
+ * the global third-party folder without path edits.
  */
 
 const MODULE_KEY = 'DraftFlow';
 const EXTENSION_ID = 'third-party/SillyTavern-DraftFlow';
 
-const DRAFT_PROMPT_DEFAULT = [
-    'You are drafting, not writing the final reply. Continue the current scene with the next %TURNS% message(s) from {{char}}.',
-    '',
-    'Write a rough first pass. Prioritize:',
-    '- what {{char}} wants right now, and what is in the way',
-    '- concrete actions, dialogue, and sensory detail',
-    '- a cause-and-effect chain from one message to the next',
-    '- an opening beat that reacts to the last message in the chat',
-    '',
-    'Rules:',
-    "- Write only {{char}}'s messages. Never write {{user}}'s words, thoughts, or actions.",
-    '- Do not summarize, explain, or comment on the task.',
-    '- Separate each message with a line containing exactly @@TURN@@.',
-    '- If %TURNS% is 1, output exactly one message and no separator.',
-].join('\n');
-
 const REVIEW_PROMPT_DEFAULT = [
-    'Below is your own rough draft of the next %TURNS% message(s) from {{char}}.',
+    'The last message in the chat is the finished reply {{char}} just wrote. Do not continue the scene and do not write a new message.',
     '',
-    '<draft>',
+    '<message>',
     '%DRAFT%',
-    '</draft>',
+    '</message>',
     '',
-    'Review the draft privately against these criteria:',
-    '- continuity with the preceding chat, established facts, and the current scene state',
-    "- {{char}}'s voice, mannerisms, knowledge, and boundaries, with no out-of-character knowledge",
+    'Critique it privately:',
+    '- continuity with the preceding chat and established facts',
+    "- {{char}}'s voice, mannerisms, knowledge, and boundaries",
     "- no control over {{user}}'s words, thoughts, or actions",
-    '- each message reacts to the previous one; no repeated beats or restated openings',
-    '- specific, concrete detail; remove filler, purple prose, and meta-commentary',
-    '- the final message leaves the scene open for {{user}}',
+    '- concrete detail, clear cause and effect, no filler or repeated beats',
+    '- the same tense, POV, and approximate length; keep every fact that matters',
     '',
-    'Fix every problem silently. Then output ONLY the improved final messages, separated by a line containing exactly @@TURN@@.',
-    'Do not include the critique, headings, labels, or any explanation.',
+    'Then output ONLY the rewritten message between <revised> and </revised>.',
+    'Do not include the critique, a preamble, labels, or commentary. If it is already good, change as little as possible.',
 ].join('\n');
 
 const DEFAULT_SETTINGS = {
-    turns: 3,
-    refine: true,
-    tokensPerTurn: 400,
-    draftPrompt: DRAFT_PROMPT_DEFAULT,
+    enabled: true,
+    refineSwipes: true,
+    maxTokens: 0,
     reviewPrompt: REVIEW_PROMPT_DEFAULT,
 };
 
-let isRunning = false;
+let isRefining = false;
+let stopRequested = false;
 
 /** @returns {any} Live SillyTavern context. */
 function ctx() {
@@ -63,12 +50,15 @@ function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
 }
 
-function makeBatchId() {
-    return `df-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function escapeRegExp(value) {
-    return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+/** FNV-1a, enough to notice that a message changed since the last refinement. */
+function hashString(value) {
+    const text = String(value ?? '');
+    let hash = 2166136261;
+    for (let i = 0; i < text.length; i++) {
+        hash ^= text.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(16);
 }
 
 function getSettings() {
@@ -89,377 +79,432 @@ function saveSettings() {
     ctx().saveSettingsDebounced();
 }
 
-function getResponseBudget(turns) {
-    const perTurn = Number(getSettings().tokensPerTurn) || 0;
+function messageElement(messageId) {
+    return $(`.mes[mesid="${messageId}"]`);
+}
+
+function setRefiningIndicator(messageId, active) {
+    messageElement(messageId).toggleClass('draftflow-refining', !!active);
+}
+
+function lockSend(locked) {
     const context = ctx();
-    const contextSize = Number(context.maxContext) || 8192;
-    const cap = Math.max(256, Math.floor(contextSize * 0.5));
-
-    if (perTurn > 0) {
-        return Math.min(cap, Math.max(64, perTurn * turns));
+    if (locked) {
+        context.deactivateSendButtons?.();
+    } else {
+        context.activateSendButtons?.();
     }
-
-    // A single message may use the user's normal reply length; multi-turn batches
-    // get proportional headroom so the parser does not see a cut-off sequence.
-    return turns > 1 ? Math.min(cap, 400 * turns) : null;
 }
 
-function label(text, name) {
-    const value = String(text ?? '').replace(/\r\n/g, '\n').trim();
-    if (!name) {
-        return value;
-    }
+function installSendGuard() {
+    const isEnter = (event) => event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.isComposing;
 
-    const prefix = new RegExp(`^${escapeRegExp(name)}\\s*[:：]\\s*`, 'i');
-    return value.replace(prefix, '').trim();
+    document.addEventListener('keydown', (event) => {
+        if (!isRefining || !isEnter(event)) {
+            return;
+        }
+        if (event.target instanceof HTMLTextAreaElement && event.target.id === 'send_textarea') {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+        }
+    }, true);
+
+    document.addEventListener('click', (event) => {
+        if (!isRefining) {
+            return;
+        }
+        if (event.target instanceof Element && event.target.closest('#send_but')) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+        }
+    }, true);
 }
 
-function stripWrappingFence(text) {
-    return String(text ?? '')
+/**
+ * Pulls the rewritten message out of the model output.
+ * @param {string} raw Model output
+ * @returns {string} Clean revised text
+ */
+function extractRevision(raw) {
+    let text = String(raw ?? '').replace(/\r\n/g, '\n').trim();
+    const tagged = text.match(/<revised>([\s\S]*?)<\/revised>/i);
+    if (tagged) {
+        text = tagged[1];
+    }
+
+    text = text
+        .replace(/^\s*(?:here (?:is|are)[^\n:]*|revised(?: message)?|rewritten(?: message)?|final(?: message)?)\s*:\s*\n?/i, '')
         .replace(/^\s*```[a-z0-9_-]*\s*\n?/i, '')
         .replace(/\n?\s*```\s*$/i, '')
-        .trim();
+        .replace(/^\s*<revised>\s*/i, '')
+        .replace(/\s*<\/revised>\s*$/i, '');
+
+    return text.trim();
 }
 
-/**
- * Removes a leading "Here are the final messages:" style preamble.
- * @param {string} text Model output
- * @returns {string} Text without the preamble
- */
-function stripPreamble(text) {
-    return String(text ?? '').replace(
-        /^\s*(?:here (?:is|are)[^\n:]*|(?:rough\s+)?draft|final(?: messages)?|improved(?: messages)?|polished(?: messages)?)\s*:\s*\n?/i,
-        '',
-    );
-}
-
-/**
- * Splits a model reply on the turn marker and cleans each part.
- * @param {string} text Model output
- * @param {number} turns Requested number of messages
- * @returns {string[]} Messages, at most `turns`
- */
-function parseTurns(text, turns) {
-    const cleaned = stripPreamble(stripWrappingFence(text));
-    if (!cleaned) {
-        return [];
+async function estimateResponseLength(original) {
+    const configured = Number(getSettings().maxTokens) || 0;
+    if (configured > 0) {
+        return configured;
     }
 
-    const parts = cleaned
-        .split(/^[ \t*_>-]*@@TURN@@[ \t*_>-]*$/im)
-        .map((part) => label(part, ctx().name2))
-        .map((part) => stripWrappingFence(part))
-        .filter((part) => part.length > 0);
-
-    if (parts.length === 1 && turns > 1) {
-        console.debug('[DraftFlow] Model returned a single block for a multi-turn batch.');
+    try {
+        const context = ctx();
+        const tokens = await context.getTokenCountAsync(original, 0);
+        const contextSize = Number(context.maxContext) || 8192;
+        if (Number.isFinite(tokens) && tokens > 0) {
+            return Math.min(Math.max(256, Math.ceil(tokens * 1.3) + 48), Math.floor(contextSize * 0.5));
+        }
+    } catch {
+        // Fall through to the backend's default reply length.
     }
 
-    return parts.slice(0, turns);
+    return null;
 }
 
-function setUiBusy(busy) {
-    const $button = $('#draftflow_wand_button');
-    $button.toggleClass('disabled', busy);
-    $button.find('.draftflow_wand_label').text(busy ? 'Drafting…' : 'DraftFlow');
-    $('#draftflow_generate').prop('disabled', busy);
-}
-
-function getBatch() {
+function getRefinementRecord() {
     const context = ctx();
-    const batch = context.chatMetadata?.[MODULE_KEY]?.lastBatch;
-    if (!batch || batch.chatId !== context.getCurrentChatId()) {
+    const record = context.chatMetadata?.[MODULE_KEY]?.lastRefinement;
+    if (!record || record.chatId !== context.getCurrentChatId()) {
         return null;
     }
-    return batch;
+
+    const message = context.chat?.[record.messageId];
+    if (!message || message.mes !== record.revised) {
+        return null;
+    }
+
+    return { record, message };
 }
 
-function updateUndoButton() {
-    const hasBatch = !!getBatch();
-    $('#draftflow_undo').toggle(hasBatch);
-    $('#draftflow_undo_wand').toggle(hasBatch);
+function updateActionButtons() {
+    const hasRevert = !!getRefinementRecord();
+    $('#draftflow_revert').toggle(hasRevert);
+    $('#draftflow_revert_wand').toggle(hasRevert);
+    $('#draftflow_refine').prop('disabled', isRefining);
+    $('#draftflow_wand_button').toggleClass('disabled', isRefining);
 }
 
-async function generateDraft(turns) {
+/**
+ * Runs one review generation and replaces the message with the revision.
+ * @param {number} messageId Message index in the chat
+ * @param {{manual?: boolean}} [options] Options
+ * @returns {Promise<boolean>} True if the message was replaced
+ */
+async function refineReply(messageId, { manual = false } = {}) {
     const context = ctx();
     const settings = getSettings();
-    const prompt = String(settings.draftPrompt ?? DRAFT_PROMPT_DEFAULT).replaceAll('%TURNS%', String(turns));
 
-    toastr.info(`Writing the first draft…`, 'DraftFlow', { timeOut: 2200, preventDuplicates: true });
-
-    const response = await context.generateQuietPrompt({
-        quietPrompt: prompt,
-        responseLength: getResponseBudget(turns),
-        removeReasoning: true,
-        trimToSentence: true,
-    });
-
-    const draft = String(response ?? '').trim();
-    if (!draft) {
-        throw new Error('The draft pass returned nothing. Check the connection or that the request was not stopped.');
-    }
-
-    console.debug('[DraftFlow] Draft:\n' + draft);
-    return draft;
-}
-
-async function reviewDraft(draft, turns) {
-    const context = ctx();
-    const settings = getSettings();
-    const prompt = String(settings.reviewPrompt ?? REVIEW_PROMPT_DEFAULT)
-        .replaceAll('%TURNS%', String(turns))
-        .split('%DRAFT%').join(draft);
-
-    toastr.info(`Reviewing its own draft…`, 'DraftFlow', { timeOut: 2200, preventDuplicates: true });
-
-    const response = await context.generateQuietPrompt({
-        quietPrompt: prompt,
-        responseLength: getResponseBudget(turns),
-        removeReasoning: true,
-        trimToSentence: true,
-    });
-
-    const finalText = String(response ?? '').trim();
-    if (!finalText) {
-        throw new Error('The review pass returned nothing.');
-    }
-
-    console.debug('[DraftFlow] Final:\n' + finalText);
-    return finalText;
-}
-
-async function insertTurns(parts, chatId) {
-    const context = ctx();
-    const batchId = makeBatchId();
-    const startIndex = context.chat.length;
-
-    try {
-        for (const part of parts) {
-            await context.saveReply({ type: 'normal', getMessage: part });
-            const message = context.chat[context.chat.length - 1];
-            if (message && typeof message === 'object') {
-                message.extra ??= {};
-                message.extra.draftflow = true;
-                message.extra.draftflowBatch = batchId;
-            }
+    if (isRefining) {
+        if (manual) {
+            toastr.info('DraftFlow is already refining a reply.', 'DraftFlow');
         }
-    } catch (error) {
-        while (context.chat.length > startIndex) {
-            context.chat.pop();
+        return false;
+    }
+
+    if (!settings.enabled && !manual) {
+        return false;
+    }
+
+    if (context.groupId || context.characterId === undefined) {
+        if (manual) {
+            toastr.warning('DraftFlow supports solo character chats only.', 'DraftFlow');
         }
-        await context.saveChat();
-        await context.reloadCurrentChat();
-        throw error;
+        return false;
     }
 
-    context.chatMetadata ??= {};
-    context.chatMetadata[MODULE_KEY] = {
-        ...(context.chatMetadata?.[MODULE_KEY] ?? {}),
-        lastBatch: {
-            chatId,
-            batchId,
-            count: parts.length,
-            createdAt: Date.now(),
-        },
-    };
-
-    await context.saveChat();
-    context.scrollChatToBottom?.();
-}
-
-async function undoLastBatch() {
-    const context = ctx();
-    const batch = getBatch();
-
-    if (!batch) {
-        toastr.info(`There is no DraftFlow batch to undo in this chat.`, 'DraftFlow');
-        return;
+    if (!Array.isArray(context.chat)) {
+        return false;
     }
 
-    const tagged = [];
-    context.chat.forEach((message, index) => {
-        if (message?.extra?.draftflowBatch === batch.batchId) {
-            tagged.push(index);
+    const message = context.chat[messageId];
+    if (!message || message.is_user || message.is_system || message.extra?.isSmallSys) {
+        if (manual) {
+            toastr.info('The last message is not a character reply.', 'DraftFlow');
         }
-    });
-
-    const first = tagged[0];
-    const isTail = tagged.length === batch.count && first === context.chat.length - tagged.length;
-
-    if (!isTail) {
-        toastr.warning(
-            `The chat changed since this batch. Delete its messages manually instead of using Undo.`,
-            'DraftFlow',
-        );
-        return;
-    }
-
-    for (let index = context.chat.length - 1; index >= first; index--) {
-        context.chat.splice(index, 1);
-    }
-
-    delete context.chatMetadata[MODULE_KEY].lastBatch;
-    await context.saveChat();
-    await context.reloadCurrentChat();
-    updateUndoButton();
-    toastr.success(`Removed ${tagged.length} message(s).`, 'DraftFlow');
-}
-
-async function runDraftFlow({ turns, refine } = {}) {
-    const context = ctx();
-
-    if (isRunning) {
-        toastr.info(`DraftFlow is already running.`, 'DraftFlow');
         return false;
     }
 
-    if (context.groupId) {
-        toastr.warning(`DraftFlow does not support group chats yet.`, 'DraftFlow');
+    if (typeof message.mes !== 'string' || !message.mes.trim() || messageId !== context.chat.length - 1) {
         return false;
     }
 
-    if (context.characterId === undefined || !context.characters?.[context.characterId]) {
-        toastr.warning(`Open a character chat first.`, 'DraftFlow');
+    const original = message.mes;
+    const swipeId = Number.isInteger(message.swipe_id) ? message.swipe_id : 0;
+    const originalHash = hashString(original);
+    if (!manual && message.extra?.draftflowHash === originalHash) {
         return false;
     }
 
-    if (!Array.isArray(context.chat) || context.chat.length === 0) {
-        toastr.warning(`Start a chat before running DraftFlow.`, 'DraftFlow');
-        return false;
-    }
-
-    if ($('#mes_stop').is(':visible') || context.streamingProcessor) {
-        toastr.warning(`Wait for the current generation to finish.`, 'DraftFlow');
-        return false;
-    }
-
-    const pendingText = String($('#send_textarea').val() ?? '').trim();
-    if (pendingText) {
-        toastr.warning(`Send your typed message first — DraftFlow continues from the current chat.`, 'DraftFlow');
-        return false;
-    }
-
-    const settings = getSettings();
-    const requestedTurns = Number(turns ?? settings.turns);
-    const batchTurns = clamp(Number.isFinite(requestedTurns) ? Math.floor(requestedTurns) : 1, 1, 10);
-    const withReview = refine === undefined ? Boolean(settings.refine) : Boolean(refine);
     const chatId = context.getCurrentChatId();
+    if (manual) {
+        stopRequested = false;
+    }
+    isRefining = true;
+    setRefiningIndicator(messageId, true);
+    updateActionButtons();
 
-    isRunning = true;
-    setUiBusy(true);
+    const progressToast = toastr.info('Refining the latest reply…', 'DraftFlow', {
+        timeOut: 0,
+        extendedTimeOut: 0,
+        preventDuplicates: true,
+    });
+    lockSend(true);
 
     try {
-        const draft = await generateDraft(batchTurns);
-        let finalText = draft;
+        const prompt = String(settings.reviewPrompt ?? REVIEW_PROMPT_DEFAULT).split('%DRAFT%').join(original);
+        const responseLength = await estimateResponseLength(original);
 
-        if (withReview) {
-            try {
-                finalText = await reviewDraft(draft, batchTurns);
-            } catch (error) {
-                console.error('[DraftFlow] Review pass failed', error);
-                const insertDraftAnyway = await context.Popup.show.confirm(
-                    'DraftFlow',
-                    `The review pass failed. Insert the unrefined draft instead?`,
-                );
-                if (!insertDraftAnyway) {
-                    const cancelled = new Error('Cancelled after the review pass failed.');
-                    cancelled.isCancel = true;
-                    throw cancelled;
-                }
-                finalText = draft;
-            }
-        }
+        const raw = await context.generateQuietPrompt({
+            quietPrompt: prompt,
+            responseLength,
+            removeReasoning: true,
+            trimToSentence: true,
+        });
 
-        const parts = parseTurns(finalText, batchTurns);
-        if (!parts.length) {
-            throw new Error('Could not parse any messages from the model output.');
-        }
-
-        if (context.getCurrentChatId() !== chatId) {
-            throw new Error('The chat changed while DraftFlow was running.');
-        }
-
-        await insertTurns(parts, chatId);
-
-        const count = parts.length;
-        toastr.success(
-            count === 1
-                ? `Inserted 1 message. Use Undo to remove it.`
-                : `Inserted ${count} messages. Use Undo to remove them.`,
-            'DraftFlow',
-            { timeOut: 5000 },
-        );
-        return true;
-    } catch (error) {
-        if (error?.isCancel) {
-            console.debug('[DraftFlow]', error);
-            toastr.info(String(error.message), 'DraftFlow');
+        if (stopRequested) {
+            toastr.info('Refinement cancelled.', 'DraftFlow');
             return false;
         }
 
-        console.error('[DraftFlow]', error);
-        toastr.error(String(error?.message ?? error), 'DraftFlow', { timeOut: 8000 });
+        const revised = extractRevision(raw);
+        if (!revised) {
+            throw new Error('The review pass returned nothing usable.');
+        }
+
+        if (revised === original) {
+            message.extra ??= {};
+            message.extra.draftflowHash = originalHash;
+            toastr.info('DraftFlow reviewed the reply; no changes were needed.', 'DraftFlow', { timeOut: 2500 });
+            return false;
+        }
+
+        if (context.getCurrentChatId() !== chatId) {
+            throw new Error('The chat changed before the revision could be applied.');
+        }
+
+        const live = context.chat[messageId];
+        if (!live || live !== message || live.mes !== original) {
+            toastr.info('The reply changed while refining; the revision was discarded.', 'DraftFlow');
+            return false;
+        }
+
+        let tokenCount = null;
+        if (context.powerUserSettings?.message_token_count_enabled) {
+            try {
+                tokenCount = await context.getTokenCountAsync(revised, 0);
+            } catch {
+                tokenCount = null;
+            }
+        }
+
+        context.chatMetadata ??= {};
+        context.chatMetadata[MODULE_KEY] = {
+            ...(context.chatMetadata[MODULE_KEY] ?? {}),
+            lastRefinement: { chatId, messageId, swipeId, original, revised, at: Date.now() },
+        };
+
+        live.mes = revised;
+        if (Array.isArray(live.swipes) && Number.isInteger(live.swipe_id)) {
+            live.swipes[live.swipe_id] = revised;
+        }
+        if (Array.isArray(live.swipe_info) && live.swipe_info[swipeId] && typeof live.swipe_info[swipeId] === 'object') {
+            live.swipe_info[swipeId].extra ??= {};
+            if (tokenCount !== null) {
+                live.swipe_info[swipeId].extra.token_count = tokenCount;
+            }
+        }
+
+        live.extra ??= {};
+        delete live.extra.display_text;
+        delete live.extra.reasoning_display_text;
+        live.extra.draftflowHash = hashString(revised);
+        live.extra.draftflowRefinedAt = Date.now();
+        if (tokenCount !== null) {
+            live.extra.token_count = tokenCount;
+        }
+
+        context.updateMessageBlock?.(messageId, live);
+        await context.saveChat();
+        updateActionButtons();
+        toastr.success('Reply refined.', 'DraftFlow', { timeOut: 2000, preventDuplicates: true });
+        return true;
+    } catch (error) {
+        if (stopRequested || error?.name === 'AbortError' || /abort/i.test(String(error?.message))) {
+            toastr.info('Refinement cancelled.', 'DraftFlow');
+        } else {
+            console.error('[DraftFlow] Refinement failed', error);
+            toastr.error(String(error?.message ?? error), 'DraftFlow', { timeOut: 6000 });
+        }
         return false;
     } finally {
-        isRunning = false;
-        setUiBusy(false);
-        updateUndoButton();
+        isRefining = false;
+        setRefiningIndicator(messageId, false);
+        if (progressToast) {
+            toastr.clear(progressToast);
+        }
+        lockSend(false);
+        updateActionButtons();
     }
+}
+
+async function refineLastReply() {
+    const context = ctx();
+    if (isRefining) {
+        toastr.info('DraftFlow is already refining a reply.', 'DraftFlow');
+        return;
+    }
+
+    const messageId = context.chat?.length ? context.chat.length - 1 : -1;
+    if (messageId < 0) {
+        toastr.warning('Open a chat first.', 'DraftFlow');
+        return;
+    }
+
+    await refineReply(messageId, { manual: true });
+}
+
+async function revertLastRefinement() {
+    const context = ctx();
+    const found = getRefinementRecord();
+
+    if (!found) {
+        toastr.info('There is no DraftFlow refinement to revert in this chat.', 'DraftFlow');
+        return;
+    }
+
+    const { record, message } = found;
+
+    let tokenCount = null;
+    if (context.powerUserSettings?.message_token_count_enabled) {
+        try {
+            tokenCount = await context.getTokenCountAsync(record.original, 0);
+        } catch {
+            tokenCount = null;
+        }
+    }
+
+    message.mes = record.original;
+    if (Array.isArray(message.swipes) && Number.isInteger(record.swipeId)) {
+        message.swipes[record.swipeId] = record.original;
+    }
+    if (Array.isArray(message.swipe_info) && message.swipe_info[record.swipeId]) {
+        message.swipe_info[record.swipeId].extra ??= {};
+        if (tokenCount !== null) {
+            message.swipe_info[record.swipeId].extra.token_count = tokenCount;
+        }
+    }
+
+    if (message.extra) {
+        delete message.extra.display_text;
+        delete message.extra.reasoning_display_text;
+        delete message.extra.draftflowHash;
+        delete message.extra.draftflowRefinedAt;
+        if (tokenCount !== null) {
+            message.extra.token_count = tokenCount;
+        }
+    }
+
+    delete context.chatMetadata[MODULE_KEY].lastRefinement;
+    context.updateMessageBlock?.(record.messageId, message);
+    await context.saveChat();
+    updateActionButtons();
+    toastr.success('Reverted to the original reply.', 'DraftFlow');
+}
+
+function onGenerationStarted(type) {
+    if (type !== 'quiet') {
+        stopRequested = false;
+    }
+}
+
+function onGenerationStopped() {
+    stopRequested = true;
+}
+
+async function onCharacterMessageRendered(rawMessageId, type) {
+    if (isRefining || stopRequested) {
+        return;
+    }
+
+    const settings = getSettings();
+    if (!settings.enabled) {
+        return;
+    }
+
+    if (type !== 'normal' && type !== 'swipe') {
+        return;
+    }
+
+    if (type === 'swipe' && !settings.refineSwipes) {
+        return;
+    }
+
+    const context = ctx();
+    if (context.groupId || context.characterId === undefined) {
+        return;
+    }
+
+    const messageId = Number(rawMessageId);
+    if (!Array.isArray(context.chat) || !Number.isInteger(messageId) || messageId !== context.chat.length - 1) {
+        return;
+    }
+
+    const message = context.chat[messageId];
+    if (!message || message.is_user || message.is_system || !message.mes?.trim()) {
+        return;
+    }
+
+    if (message.extra?.draftflowHash === hashString(message.mes)) {
+        return;
+    }
+
+    await refineReply(messageId);
 }
 
 function bindSettingsPanel() {
     const settings = getSettings();
 
-    $('#draftflow_turns')
-        .val(settings.turns)
-        .on('input change', function () {
-            const value = clamp(parseInt(String($(this).val()), 10) || 1, 1, 10);
-            settings.turns = value;
-            $(this).val(value);
+    $('#draftflow_enabled')
+        .prop('checked', !!settings.enabled)
+        .on('change', function () {
+            settings.enabled = !!$(this).prop('checked');
             saveSettings();
+            updateActionButtons();
         });
 
-    $('#draftflow_refine')
-        .prop('checked', !!settings.refine)
+    $('#draftflow_swipes')
+        .prop('checked', !!settings.refineSwipes)
         .on('change', function () {
-            settings.refine = !!$(this).prop('checked');
+            settings.refineSwipes = !!$(this).prop('checked');
             saveSettings();
         });
 
     $('#draftflow_tokens')
-        .val(settings.tokensPerTurn)
+        .val(settings.maxTokens)
         .on('input change', function () {
             const value = clamp(parseInt(String($(this).val()), 10) || 0, 0, 8000);
-            settings.tokensPerTurn = value;
+            settings.maxTokens = value;
             $(this).val(value);
             saveSettings();
         });
 
-    $('#draftflow_draft_prompt')
-        .val(settings.draftPrompt)
-        .on('input', function () {
-            settings.draftPrompt = String($(this).val());
-            saveSettings();
-        });
-
-    $('#draftflow_review_prompt')
+    $('#draftflow_prompt')
         .val(settings.reviewPrompt)
         .on('input', function () {
             settings.reviewPrompt = String($(this).val());
             saveSettings();
         });
 
-    $('#draftflow_reset_prompts').on('click', () => {
-        settings.draftPrompt = DRAFT_PROMPT_DEFAULT;
+    $('#draftflow_reset_prompt').on('click', () => {
         settings.reviewPrompt = REVIEW_PROMPT_DEFAULT;
-        $('#draftflow_draft_prompt').val(DRAFT_PROMPT_DEFAULT);
-        $('#draftflow_review_prompt').val(REVIEW_PROMPT_DEFAULT);
+        $('#draftflow_prompt').val(REVIEW_PROMPT_DEFAULT);
         saveSettings();
-        toastr.info(`Prompt templates restored to defaults.`, 'DraftFlow');
+        toastr.info('Review prompt restored to its default.', 'DraftFlow');
     });
 
-    $('#draftflow_generate').on('click', () => runDraftFlow());
-    $('#draftflow_undo').on('click', () => undoLastBatch());
+    $('#draftflow_refine').on('click', () => refineLastReply());
+    $('#draftflow_revert').on('click', () => revertLastRefinement());
 }
 
 async function addSettingsPanel() {
@@ -472,7 +517,7 @@ async function addSettingsPanel() {
     const $container = $('#extensions_settings2').length ? $('#extensions_settings2') : $('#extensions_settings');
     $container.append(html);
     bindSettingsPanel();
-    updateUndoButton();
+    updateActionButtons();
 }
 
 function addWandButtons(attempt = 0) {
@@ -488,33 +533,33 @@ function addWandButtons(attempt = 0) {
         return;
     }
 
-    const $button = $(`
-        <div id="draftflow_wand_button" class="list-group-item flex-container flexGap5" title="Draft, self-review, then insert consecutive messages">
+    const $refine = $(`
+        <div id="draftflow_wand_button" class="list-group-item flex-container flexGap5" title="Run the DraftFlow self-review pass on the latest reply">
             <div class="fa-solid fa-feather-pointed extensionsMenuExtensionButton"></div>
-            <span class="draftflow_wand_label">DraftFlow</span>
+            <span class="draftflow_wand_label">DraftFlow: refine last reply</span>
         </div>
     `);
 
-    const $undo = $(`
-        <div id="draftflow_undo_wand" class="list-group-item flex-container flexGap5" title="Remove the messages from the last DraftFlow batch" style="display: none;">
+    const $revert = $(`
+        <div id="draftflow_revert_wand" class="list-group-item flex-container flexGap5" title="Restore the reply from before the last DraftFlow refinement" style="display: none;">
             <div class="fa-solid fa-rotate-left extensionsMenuExtensionButton"></div>
-            <span>Undo DraftFlow batch</span>
+            <span>DraftFlow: revert last refinement</span>
         </div>
     `);
 
-    $menu.append($undo).append($button);
+    $menu.append($revert).append($refine);
 
-    $button.on('click', () => runDraftFlow());
-    $undo.on('click', () => undoLastBatch());
+    $refine.on('click', () => refineLastReply());
+    $revert.on('click', () => revertLastRefinement());
 
-    updateUndoButton();
+    updateActionButtons();
 }
 
 function registerSlashCommand() {
     const context = ctx();
-    const { SlashCommandParser, SlashCommand, SlashCommandNamedArgument, ARGUMENT_TYPE } = context;
+    const { SlashCommandParser, SlashCommand } = context;
 
-    if (!SlashCommandParser || !SlashCommand || !SlashCommandNamedArgument || !ARGUMENT_TYPE) {
+    if (!SlashCommandParser || !SlashCommand) {
         console.warn('[DraftFlow] Slash command API is unavailable; skipping /draftflow registration.');
         return;
     }
@@ -522,26 +567,10 @@ function registerSlashCommand() {
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'draftflow',
         returns: 'status',
-        helpString: 'Draft the next few character messages, self-review them, then insert them into the chat. Named args: turns=1-10, refine=true|false.',
-        namedArgumentList: [
-            SlashCommandNamedArgument.fromProps({
-                name: 'turns',
-                description: 'Number of consecutive character messages to generate (1-10).',
-                typeList: [ARGUMENT_TYPE.NUMBER],
-                isRequired: false,
-            }),
-            SlashCommandNamedArgument.fromProps({
-                name: 'refine',
-                description: 'Run the self-review pass before inserting.',
-                typeList: [ARGUMENT_TYPE.BOOLEAN],
-                isRequired: false,
-            }),
-        ],
-        callback: async (args) => {
-            const turns = args?.turns === undefined ? undefined : Number(args.turns);
-            const refine = args?.refine === undefined ? undefined : String(args.refine) !== 'false';
-            const inserted = await runDraftFlow({ turns, refine });
-            return inserted ? 'DraftFlow: inserted' : 'DraftFlow: nothing inserted';
+        helpString: 'Run the DraftFlow self-review pass on the latest character reply, even when automatic refinement is off.',
+        callback: async () => {
+            await refineLastReply();
+            return 'DraftFlow: refinement requested';
         },
     }));
 }
@@ -572,9 +601,14 @@ jQuery(async () => {
     }
 
     try {
+        installSendGuard();
         const context = ctx();
-        context.eventSource.on(context.eventTypes.CHAT_CHANGED, () => updateUndoButton());
+        context.eventSource.makeFirst(context.eventTypes.CHARACTER_MESSAGE_RENDERED, onCharacterMessageRendered);
+        context.eventSource.on(context.eventTypes.GENERATION_STARTED, onGenerationStarted);
+        context.eventSource.on(context.eventTypes.GENERATION_STOPPED, onGenerationStopped);
+        context.eventSource.on(context.eventTypes.CHAT_CHANGED, () => updateActionButtons());
+        context.eventSource.on(context.eventTypes.MESSAGE_DELETED, () => updateActionButtons());
     } catch (error) {
-        console.error('[DraftFlow] Could not subscribe to chat changes', error);
+        console.error('[DraftFlow] Could not subscribe to chat events', error);
     }
 });

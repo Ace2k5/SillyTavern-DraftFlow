@@ -1,102 +1,104 @@
 # DraftFlow
 
-A small SillyTavern extension that generates **several consecutive character messages in one pass** by first
-drafting them, then letting the model review and rewrite its own draft before anything is posted.
+A small SillyTavern extension that gives the model **one extra turn to review its own reply** before you move on.
 
-The idea is simple: the model is much better at fixing a scene it can *read* than at writing a perfect scene cold.
-DraftFlow gives it that second look without you copy-pasting anything.
+After each character message is generated, DraftFlow runs one hidden generation in which the model reads that
+exact message, critiques it privately, and rewrites it. The rewrite replaces the draft **in place**, so the chat
+history keeps a single message — the revised one.
+
+This is not a multi-turn batch generator. One reply in, one improved reply out.
+
+## What it looks like
+
+1. You send your message. SillyTavern generates the character's reply normally, and it appears.
+2. DraftFlow immediately dims that message and runs one quiet review generation.
+3. When the rewrite arrives, the message text is replaced (swipes, token count and rendering are updated too).
+   A toast confirms it, and **Revert last refinement** restores the previous text if you prefer it.
+
+Because the draft is generated first, you will briefly see the original reply and then the revised version. That
+is intentional: the model is reviewing the message it actually wrote, not a separate planning draft.
 
 ## How it works
 
-1. **Draft pass** — a background generation (same character, persona, lorebook, author's note and chat history)
-   writes a rough version of the next *N* messages. Content first, polish later.
-2. **Review pass** — a second background generation receives the draft and a short rubric: continuity, character
-   voice, no godmoding the user, turn-to-turn reactions, concrete detail. It silently fixes the problems and
-   returns the final messages.
-3. **Insert** — the final text is split on `@@TURN@@`, cleaned up, and turned into real character messages with
-   SillyTavern's own message pipeline (avatar, swipes, token counts). The batch is tagged so it can be removed again
-   with Undo.
+- Listens for `CHARACTER_MESSAGE_RENDERED` before other extensions, so the review runs on fresh replies and swipes.
+- Builds a quiet prompt containing the reply plus a rubric: continuity, character voice, no godmoding the user,
+  concrete detail, no repeated beats, preserved facts and length.
+- Requests the rewrite between `<revised>` and `</revised>` tags, with the raw output as a fallback.
+- Replaces `message.mes`, the active swipe, its swipe metadata, and the token count, then re-renders and saves the chat.
+- Stores the previous text in `chat_metadata.DraftFlow.lastRefinement` so the most recent swap can be reverted.
 
-Both passes use `generateQuietPrompt`, so they appear in the same context as your normal replies but never post a
-message by themselves.
+Everything is obtained through `SillyTavern.getContext()`, so the folder works from
+`data/<user>/extensions` or the global `public/scripts/extensions/third-party` directory without path edits.
 
 ## Install
 
-1. Copy the `SillyTavern-DraftFlow` folder into:
-   `SillyTavern/data/<your-user>/extensions/`
-   (for most installs that is `SillyTavern/data/default-user/extensions/`).
+1. Copy the `SillyTavern-DraftFlow` folder into `SillyTavern/data/<your-user>/extensions/`
+   (usually `SillyTavern/data/default-user/extensions/`), or install it from
+   `https://github.com/Ace2k5/SillyTavern-DraftFlow` through the Extensions manager.
 2. Reload the SillyTavern page.
 3. Open the Extensions panel (plug icon) and enable **DraftFlow**.
-4. Its settings drawer appears at the bottom of the Extensions panel.
 
-No server restart is needed — only a page reload so the client discovers the new folder.
+Only a page reload is needed, not a server restart.
 
-## Use
+## Usage
 
-- Type and send your own message first.
-- Then click the wand (magic wand) menu → **DraftFlow**, or press the **Generate now** button in the settings
-  drawer, or run:
+- **Automatic (default):** enabled on install. Every new character reply gets one review pass.
+- **Manual:** wand menu → **DraftFlow: refine last reply**, the button in the settings drawer, or
+  `/draftflow`. Manual runs work even when automatic refinement is off.
+- **Undo a swap:** wand menu → **DraftFlow: revert last refinement**, or the button in the settings drawer.
 
-  ```
-  /draftflow turns=3
-  /draftflow turns=2 refine=false
-  ```
-
-The messages are inserted immediately. A toast confirms the count; use **Undo last batch** in the wand menu (or in
-the settings drawer) to remove them.
-
-> DraftFlow refuses to run while the input box contains unsent text. This is deliberate: it continues the chat that
-> is already on screen, so the pending message must be sent first.
+Refinement is skipped when it would be unsafe or pointless: group chats, first messages, continuations, system
+messages, stopped generations, an already-refined message, or a chat/message that changed mid-pass.
 
 ## Settings
 
 | Setting | Default | Notes |
 | --- | --- | --- |
-| Messages per batch | 3 | 1–10 consecutive character messages. |
-| Self-review pass | on | Two API calls. Turn it off to insert the raw draft (cheaper, rougher). |
-| Max tokens per message | 400 | Output budget per turn. Raise it for long-form prose. |
-| Draft / review prompts | built in | Editable under *Prompt templates*. `%TURNS%` and `%DRAFT%` are substituted by the extension; `{{char}}` / `{{user}}` are resolved by SillyTavern. |
-| Undo last batch | — | Only available while the batch is still at the end of the chat. |
+| Refine every new reply automatically | on | Off means only manual runs. |
+| Also refine swipes and regenerations | on | Off limits automatic refinement to fresh replies; `/draftflow` still works on a swipe. |
+| Max revision tokens | 0 (auto) | Auto sizes the budget from the reply, about 1.3×. Raise for long replies that get cut off. |
+| Review prompt | built in | Editable. `%DRAFT%` is replaced with the reply; `{{char}}` / `{{user}}` are resolved by SillyTavern. |
 
-## Limitations (v0.1)
+## Cost
 
-- **Solo chats only.** Group chats are blocked because speaker attribution across a batch needs a different design.
-- **Two generations per run.** Expect roughly double latency and token cost compared with one normal reply.
-- **Immediate insert, no preview.** That was the chosen workflow; the Undo button is the safety net.
-- **Undo is conservative.** If you add or delete messages after a batch, Undo refuses rather than cutting into the
-  middle of the chat.
-- **Other extensions see each inserted message** through `MESSAGE_RECEIVED`. Auto-summary, TTS or similar features
-  may react to a batch as N separate messages.
-- **Parsing is marker-based.** If the model ignores `@@TURN@@`, you get fewer messages than requested (often one).
-  Lower the batch size or strengthen the prompt template in that case.
-- **No reasoning display.** Quiet generations have their reasoning stripped by default.
+Two generations per refined reply instead of one, so roughly double latency and tokens. The draft is still
+generated at normal speed; the extra time is spent while the response is dimmed. Turn the automatic toggle off
+if you only want the pass occasionally.
+
+## Limitations
+
+- **Solo character chats only.** Group chats are skipped in this version.
+- **The reply visibly changes.** This is the requested behavior; if you need the final text to appear only once,
+  the review has to run before display, which delays the first output by a full generation.
+- **Revert is one step.** Only the most recent refinement can be undone, and only while the message still contains
+  the revised text.
+- **Tag-based parsing.** If the model ignores `<revised>`, the whole cleaned output is used. A model that writes a
+  critique into the same block can leak it into the reply; shorten or harden the review prompt if that happens.
+- **Edited/deleted messages during a pass** cause that revision to be discarded rather than overwriting your edit.
+- **Streaming does not hide the draft.** Streaming finishes, the message is rendered, then the revision replaces it.
 
 ## Troubleshooting
 
-| Symptom | Likely cause / fix |
+| Symptom | Fix |
 | --- | --- |
-| `/draftflow` is unknown | Extension not enabled, or the page was not reloaded after copying the folder. |
-| "Send your typed message first" | Clear or send the input box, then run DraftFlow. |
-| "Open a character chat first" | DraftFlow needs a character and a non-empty chat. |
-| Nothing inserted, error toast | Check the ST server console and the browser console; the draft or review request failed or was stopped. |
-| Only one message arrived | The model did not use the separator. Lower *Messages per batch* or edit the draft prompt. |
-| Undo does nothing | The batch is no longer at the end of the chat, or you are in a different chat. |
+| Replies never change | Enable the extension and the "Refine every new reply" toggle; check the browser console for `[DraftFlow]` errors. |
+| "Refinement cancelled" | You pressed stop, or the generation was aborted. The original reply stays. |
+| Only the first part of the reply is revised | Raise **Max revision tokens** or set it to 0 for auto. |
+| Revert button missing | The last refinement belongs to another chat, or the message text no longer matches the stored revision. |
+| `/draftflow` is unknown | Extension is disabled or the page was not reloaded after installing. |
+
+## Version history
+
+- **0.2.0** — rewritten as an automatic post-reply self-review pass with in-place replacement and one-step revert.
+  The earlier on-demand multi-message generator was removed.
+- **0.1.0** — initial batch generator (draft several messages on demand).
 
 ## Files
 
 ```
 SillyTavern-DraftFlow/
   manifest.json   extension manifest
-  index.js        settings, pipeline, insertion, Undo, slash command
+  index.js        review pipeline, replacement, revert, settings, /draftflow
   settings.html   settings drawer
-  style.css       minimal layout tweaks
+  style.css       refinement indicator and layout
 ```
-
-## Design notes
-
-- No imports from SillyTavern's module tree: everything is obtained through `SillyTavern.getContext()`, so the
-  folder works from `data/<user>/extensions` or the global `public/scripts/extensions/third-party` directory
-  without path edits.
-- The draft and review passes are sequential, so even backends that allow only one request at a time are fine.
-- The batch record lives in `chat_metadata.DraftFlow.lastBatch`, so Undo survives a page reload. The inserted
-  messages are tagged in `message.extra.draftflowBatch`.
